@@ -1,0 +1,6 @@
+{
+  "name": "ブックチャットAI",
+  "description": "Geminiを活用し、本の章ごとにAIアシスタントと対話形式で議論できるインタラクティブなアプリケーションです。",
+  "requestFramePermissions": [],
+  "prompt": ""
+}
