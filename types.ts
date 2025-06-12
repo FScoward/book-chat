@@ -12,6 +12,8 @@ export interface Chapter {
   id: string;
   title: string;
   content: string;
+  isHtmlContent?: boolean; // True if content is HTML, false/undefined for plain text
   chatInstance: Chat | null;
   messages: Message[];
+  isRead: boolean; // True if the chapter has been opened/read
 }

@@ -12,10 +12,14 @@ interface ChapterInputModalProps {
 }
 
 const MAX_TITLE_LENGTH = 200; 
+const SUPPORTED_IMAGE_TYPES = ['image/jpeg', 'image/png', 'image/gif', 'image/svg+xml'];
+
+type ManifestItem = { href: string; mediaType: string; id: string };
+type TocItem = { title: string | null; filePath: string | null; anchor?: string };
 
 const ChapterInputModal: React.FC<ChapterInputModalProps> = ({ onAddChapter, onAddChaptersBatch, onClose }) => {
   const [title, setTitle] = useState('');
-  const [content, setContent] = useState('');
+  const [content, setContent] = useState(''); 
   const [error, setError] = useState('');
   const [infoMessage, setInfoMessage] = useState<string | null>(null);
   const [isProcessingFile, setIsProcessingFile] = useState(false);
@@ -51,7 +55,7 @@ const ChapterInputModal: React.FC<ChapterInputModalProps> = ({ onAddChapter, onA
     for (const part of relativeParts) {
         if (part === '..') {
             if (baseParts.length > 0) baseParts.pop();
-        } else if (part !== '.') {
+        } else if (part !== '.' && part !== '') { // Ensure empty parts (e.g. from leading slash) are not pushed
             baseParts.push(part);
         }
     }
@@ -61,35 +65,26 @@ const ChapterInputModal: React.FC<ChapterInputModalProps> = ({ onAddChapter, onA
 
   const handleFileChange = async (event: React.ChangeEvent<HTMLInputElement>) => {
     const file = event.target.files?.[0];
-    if (!file) {
-      setContent('');
-      setTitle('');
-      setError('');
-      setInfoMessage(null);
-      return;
-    }
+    if (!file) return;
 
     if (file.type !== 'application/epub+zip') {
       setError('無効なファイルタイプです。EPUBファイル (.epub) をアップロードしてください。');
-      setContent('');
-      setTitle('');
       setInfoMessage(null);
+      if(fileInputRef.current) fileInputRef.current.value = "";
       return;
     }
 
     setError('');
     setInfoMessage(null);
     setIsProcessingFile(true);
-    setContent(''); 
-
-    const fileNameWithoutExtension = file.name.replace(/\.epub$/i, '');
     
+    const fileNameWithoutExtension = file.name.replace(/\.epub$/i, '');
     let tocPath: string | null = null;
     let tocMediaType: string | null = null;
     let tocItemsFound = false;
 
     try {
-      console.log(`EPUB処理開始: ${file.name} (タイプ: ${file.type}, サイズ: ${file.size} bytes)`);
+      console.log(`EPUB処理開始: ${file.name}`);
       setInfoMessage("EPUBファイルを解析中...");
       const arrayBuffer = await file.arrayBuffer();
       const zip = await JSZip.loadAsync(arrayBuffer);
@@ -98,340 +93,273 @@ const ChapterInputModal: React.FC<ChapterInputModalProps> = ({ onAddChapter, onA
       const containerFile = zip.file("META-INF/container.xml");
       if (!containerFile) throw new Error("META-INF/container.xml がEPUB内に見つかりません。");
       const containerXmlText = await containerFile.async("string");
-      console.debug("container.xml 内容 (先頭500文字):", containerXmlText.substring(0, 500) + (containerXmlText.length > 500 ? "..." : ""));
       const parser = new DOMParser();
       const containerDoc = parser.parseFromString(containerXmlText, "application/xml");
       const rootfilePath = containerDoc.querySelector("rootfile")?.getAttribute("full-path");
       if (!rootfilePath) throw new Error("OPFファイルのパスがcontainer.xml内で見つかりません。");
-      console.log(`OPFファイルのパス: ${rootfilePath}`);
       
       setInfoMessage("OPFファイルを解析中...");
       const opfFile = zip.file(rootfilePath);
       if (!opfFile) throw new Error(`OPFファイル (${rootfilePath}) がEPUB内に見つかりません。`);
       const opfXmlText = await opfFile.async("string");
-      console.debug("OPFファイル内容 (先頭1000文字):", opfXmlText.substring(0, 1000) + (opfXmlText.length > 1000 ? "..." : ""));
       const opfDoc = parser.parseFromString(opfXmlText, "application/xml");
       
       const dcTitle = opfDoc.querySelector("metadata > dc\\:title")?.textContent;
-      if (dcTitle) {
-        setTitle(dcTitle); 
-      } else {
-        setTitle(fileNameWithoutExtension); 
+      if (!title.trim() || title === fileNameWithoutExtension) {
+        setTitle(dcTitle || fileNameWithoutExtension); 
       }
       console.log(`EPUBタイトル (dc:title): ${dcTitle || `見つかりません、ファイル名を使用: ${fileNameWithoutExtension}`}`);
 
-      console.log("マニフェスト解析中...");
+      const manifestById: { [id: string]: ManifestItem } = {};
+      const manifestByHref: { [resolvedHref: string]: ManifestItem } = {};
       const manifestItems = opfDoc.querySelectorAll("manifest > item");
-      const manifest: { [id: string]: { href: string, mediaType: string } } = {};
-      manifestItems.forEach(item => {
-        const id = item.getAttribute("id");
-        const href = item.getAttribute("href");
-        const mediaType = item.getAttribute("media-type");
+      manifestItems.forEach(itemNode => {
+        const id = itemNode.getAttribute("id");
+        const href = itemNode.getAttribute("href");
+        const mediaType = itemNode.getAttribute("media-type");
         if (id && href && mediaType) {
-          manifest[id] = { href: getAbsolutePath(rootfilePath, href), mediaType };
+          const resolvedHref = getAbsolutePath(rootfilePath, href);
+          const manifestEntry = { href: resolvedHref, mediaType, id };
+          manifestById[id] = manifestEntry;
+          manifestByHref[resolvedHref] = manifestEntry;
         }
       });
-      console.log(`マニフェスト解析完了: ${Object.keys(manifest).length} 個のアイテム`);
-      console.debug("マニフェストオブジェクト全体:", manifest);
+      console.log(`マニフェスト解析完了: ${Object.keys(manifestById).length} 個のアイテム`);
 
       const navItem = Array.from(manifestItems).find(item => item.getAttribute("properties")?.includes("nav"));
       if (navItem) {
           const navItemId = navItem.getAttribute("id");
-          if (navItemId && manifest[navItemId] && (manifest[navItemId].mediaType === 'application/xhtml+xml' || manifest[navItemId].mediaType === 'text/html')) {
-              tocPath = manifest[navItemId].href;
-              tocMediaType = manifest[navItemId].mediaType;
-              console.log(`EPUB3 NAVドキュメント候補 (properties="nav"): ${tocPath} (タイプ: ${tocMediaType})`);
+          if (navItemId && manifestById[navItemId] && (manifestById[navItemId].mediaType === 'application/xhtml+xml' || manifestById[navItemId].mediaType === 'text/html')) {
+              tocPath = manifestById[navItemId].href;
+              tocMediaType = manifestById[navItemId].mediaType;
           }
       }
       
       if (!tocPath) { 
           const ncxItemId = opfDoc.querySelector("spine")?.getAttribute("toc");
-          if (ncxItemId && manifest[ncxItemId]) {
-              if (manifest[ncxItemId].mediaType === 'application/x-dtbncx+xml') {
-                  tocPath = manifest[ncxItemId].href;
-                  tocMediaType = manifest[ncxItemId].mediaType;
-                  console.log(`EPUB2 NCX目次候補 (spine@toc): ${tocPath} (タイプ: ${tocMediaType})`);
-              } else if (manifest[ncxItemId].mediaType === 'application/xhtml+xml' || manifest[ncxItemId].mediaType === 'text/html') {
-                  tocPath = manifest[ncxItemId].href;
-                  tocMediaType = manifest[ncxItemId].mediaType;
-                  console.log(`EPUB3 NAVドキュメント候補 (spine@toc, XHTML): ${tocPath} (タイプ: ${tocMediaType})`);
+          if (ncxItemId && manifestById[ncxItemId]) {
+              if (manifestById[ncxItemId].mediaType === 'application/x-dtbncx+xml' || manifestById[ncxItemId].mediaType === 'application/xhtml+xml' || manifestById[ncxItemId].mediaType === 'text/html') {
+                  tocPath = manifestById[ncxItemId].href;
+                  tocMediaType = manifestById[ncxItemId].mediaType;
               }
           } else { 
-              const ncxManifestItem = Object.values(manifest).find(m => m.mediaType === 'application/x-dtbncx+xml');
-              if (ncxManifestItem) {
-                  tocPath = ncxManifestItem.href;
-                  tocMediaType = ncxManifestItem.mediaType;
-                  console.log(`EPUB2 NCX目次候補 (manifest media-type): ${tocPath} (タイプ: ${tocMediaType})`);
+              const ncxManifestEntry = Object.values(manifestById).find(m => m.mediaType === 'application/x-dtbncx+xml');
+              if (ncxManifestEntry) {
+                  tocPath = ncxManifestEntry.href;
+                  tocMediaType = ncxManifestEntry.mediaType;
               }
           }
       }
 
-      if (!tocPath) {
-        console.error("目次ファイル特定失敗。OPFファイル内で目次(NAVまたはNCX)への参照が見つかりません。");
-      } else {
-        setInfoMessage(`目次ファイル (${tocPath}, タイプ: ${tocMediaType}) を解析中...`);
-        console.log(`使用する目次ファイル決定: ${tocPath}, タイプ: ${tocMediaType}`);
+      if (tocPath && tocMediaType) {
+        setInfoMessage(`目次ファイル (${tocPath}) を解析中...`);
       }
 
       const chaptersWithContent: ChapterWithContent[] = [];
-      
+      const itemsToProcess: TocItem[] = []; // Store TOC items for anchor processing
+
+      const processHtmlStringAndEmbedImages = async (
+          htmlString: string, 
+          htmlFilePath: string, // Absolute path within ZIP for this HTML file
+          zipFile: JSZip,
+          currentManifestByHref: { [resolvedHref: string]: ManifestItem }
+        ): Promise<string> => {
+        const domParser = new DOMParser();
+        const doc = domParser.parseFromString(htmlString, 'text/html'); // Parse the potentially partial HTML
+        const images = doc.querySelectorAll('img');
+
+        for (const img of Array.from(images)) {
+            const originalSrc = img.getAttribute('src');
+            if (!originalSrc || originalSrc.startsWith('data:')) continue;
+
+            const imageAbsPath = getAbsolutePath(htmlFilePath, originalSrc);
+            const imageManifestEntry = currentManifestByHref[imageAbsPath];
+
+            if (imageManifestEntry && SUPPORTED_IMAGE_TYPES.includes(imageManifestEntry.mediaType)) {
+                const imageFile = zipFile.file(imageAbsPath);
+                if (imageFile) {
+                    try {
+                        const base64Data = await imageFile.async('base64');
+                        img.setAttribute('src', `data:${imageManifestEntry.mediaType};base64,${base64Data}`);
+                        console.log(`  画像埋め込み成功: ${imageAbsPath} (元src: ${originalSrc})`);
+                    } catch (imgError) {
+                        console.error(`  画像ファイルのBase64エンコード失敗: ${imageAbsPath}`, imgError);
+                    }
+                } else {
+                    console.warn(`  画像ファイルがZip内に見つかりません: ${imageAbsPath} (元src: ${originalSrc})`);
+                }
+            } else {
+                 console.warn(`  画像のマニフェストエントリが見つからないか未対応タイプ: ${imageAbsPath} (元src: ${originalSrc}, mediaType: ${imageManifestEntry?.mediaType})`);
+            }
+        }
+        // If the input htmlString was a fragment, doc.body.innerHTML will give its content.
+        // If it was a full doc, doc.documentElement.outerHTML is better.
+        // For consistency, let's aim for a full HTML structure for the chapter content string.
+        if (doc.body && !doc.documentElement.querySelector('body')) { // If body exists but not in documentElement (e.g. fragment parsed)
+            const htmlEl = doc.createElement('html');
+            const headEl = doc.createElement('head');
+             // Optionally add a base tag if needed for very relative links, but usually not for EPUB content display
+            // const baseEl = doc.createElement('base');
+            // baseEl.href = htmlFilePath.substring(0, htmlFilePath.lastIndexOf('/') + 1);
+            // headEl.appendChild(baseEl);
+            htmlEl.appendChild(headEl);
+            htmlEl.appendChild(doc.body);
+            return htmlEl.outerHTML;
+        }
+        return doc.documentElement?.outerHTML || doc.body?.innerHTML || htmlString;
+      };
+
       if (tocPath && tocMediaType) {
         const tocFile = zip.file(tocPath);
         if (!tocFile) throw new Error(`目次ファイル (${tocPath}) がEPUB内に見つかりません。`);
         const tocXmlText = await tocFile.async("string");
-        console.debug(`目次ファイル (${tocPath}) 内容 (先頭1000文字):\n`, tocXmlText.substring(0, 1000) + (tocXmlText.length > 1000 ? "..." : ""));
         const tocDoc = parser.parseFromString(tocXmlText, tocMediaType === "application/xhtml+xml" || tocMediaType === "text/html" ? "application/xhtml+xml" : "application/xml");
-
-        const cleanText = (text: string): string => {
-            let cleaned = text.replace(/[ \t\f\v\r]+/g, ' ');
-            cleaned = cleaned.replace(/\s*\n\s*/g, '\n');
-            return cleaned.trim();
-        };
-        
-        const extractCleanTextFromHtml = (htmlString: string, chapterTitle: string | undefined, anchor?: string): string => {
-            const chapterDom = parser.parseFromString(htmlString, "text/html");
-            let sourceDescription = "ファイル全体";
-            let extractedText = "";
-            let targetElement: HTMLElement | null = null;
-
-            if (anchor && chapterDom.body) {
-                try {
-                  targetElement = chapterDom.body.querySelector(`#${CSS.escape(anchor)}`);
-                } catch (e) {
-                    targetElement = chapterDom.getElementById(anchor); // Fallback for complex selectors or older browsers
-                    console.warn(`CSS.escape or querySelector failed for anchor '${anchor}', using getElementById. Error: ${e instanceof Error ? e.message : String(e)}`);
-                }
-
-                if (targetElement) {
-                    console.log(`  アンカー #${anchor} に対応する要素 (${targetElement.tagName}) を見つかりました。`);
-                    sourceDescription = `アンカー #${anchor} の要素 (${targetElement.tagName})`;
-                    const elementClone = targetElement.cloneNode(true) as HTMLElement;
-                    elementClone.querySelectorAll('script, style').forEach(el => el.remove());
-                    extractedText = cleanText(elementClone.textContent || "");
-                    
-                    const { empty: isEmptyFromElement, reason: reasonEmptyElement } = isEffectivelyEmpty(extractedText, chapterTitle);
-                    if (isEmptyFromElement) {
-                        console.warn(`    アンカー要素 (${targetElement.tagName}#${anchor}) のテキストは実質的に空です (${reasonEmptyElement})。後続の兄弟要素からの抽出を試みます。`);
-                        let siblingTextContent = "";
-                        let currentSibling = targetElement.nextElementSibling;
-                        let siblingsProcessedCount = 0;
-                        while (currentSibling) {
-                            // Stop if we hit another heading, suggesting a new section
-                            if (/^H[1-6]$/i.test(currentSibling.tagName)) {
-                                console.log(`    次の兄弟要素 (${currentSibling.tagName}) は見出しのため、ここで収集を停止します。`);
-                                break;
-                            }
-                            const siblingClone = currentSibling.cloneNode(true) as HTMLElement;
-                            siblingClone.querySelectorAll('script, style').forEach(el => el.remove());
-                            siblingTextContent += (siblingClone.textContent || "") + "\n";
-                            siblingsProcessedCount++;
-                            currentSibling = currentSibling.nextElementSibling;
-                        }
-                        extractedText = cleanText(siblingTextContent);
-                        if (extractedText && siblingsProcessedCount > 0) {
-                           console.log(`    アンカー要素の後続の兄弟要素 ${siblingsProcessedCount} 個からテキストを抽出しました。`);
-                           sourceDescription = `アンカー #${anchor} の後続の兄弟要素群`;
-                        } else {
-                           console.warn(`    アンカー要素の後続の兄弟要素からテキストを抽出できませんでした。`);
-                           // Stick with the (empty) text from the anchor element itself, or let it fall through to placeholder
-                        }
-                    }
-                } else {
-                    console.warn(`  アンカー #${anchor} に対応する要素が見つかりませんでした。ファイル全体のテキストを使用します。`);
-                    sourceDescription = "ファイル全体 (アンカー見つからず)";
-                    // Fall through to using the whole body
-                }
-            }
-            
-            // If no anchor, or anchor element not found, or anchor text + sibling text still empty, use whole body
-            if (!extractedText.trim() && chapterDom.body) {
-                if (anchor && !targetElement) { // Anchor was specified but not found
-                     console.log(`    フォールバック: ${sourceDescription}。ファイル全体のテキストを使用します。`);
-                } else if (anchor && targetElement && !extractedText.trim()){ // Anchor found, but its text and sibling text was empty
-                    console.log(`    フォールバック: アンカー要素とその後続兄弟要素から有効なテキストが得られませんでした。ファイル全体のテキストを使用します。`);
-                }
-                sourceDescription = "ファイル全体 (フォールバック)";
-                const bodyClone = chapterDom.body.cloneNode(true) as HTMLElement;
-                bodyClone.querySelectorAll('script, style').forEach(el => el.remove());
-                extractedText = cleanText(bodyClone.textContent || "");
-            }
-
-            console.log(`    テキスト抽出元: ${sourceDescription}, 抽出後テキスト長: ${extractedText.length}`);
-            return extractedText;
-        };
-        
-        const isEffectivelyEmpty = (text: string, title: string | undefined): { empty: boolean, reason: string } => {
-            const trimmedText = text.trim();
-            if (!trimmedText) return { empty: true, reason: "内容が空でした" };
-            if (title && trimmedText.toLowerCase() === title.trim().toLowerCase()) {
-                return { empty: true, reason: "内容がタイトルと同じでした" };
-            }
-            return { empty: false, reason: "" };
-        };
-
 
         if (tocMediaType === "application/x-dtbncx+xml") { 
           console.log("NCX目次解析開始...");
           const navPoints = tocDoc.querySelectorAll("navMap > navPoint");
           if (navPoints.length > 0) tocItemsFound = true;
-          console.log(`NCX: ${navPoints.length}個のnavPointを検出`);
-          for (const navPoint of Array.from(navPoints)) {
-            let chapterTitleText = navPoint.querySelector("navLabel > text")?.textContent?.trim();
+          navPoints.forEach(navPoint => {
+            const chapterTitleText = navPoint.querySelector("navLabel > text")?.textContent?.trim() || "無題の章";
             const contentSrcRaw = navPoint.querySelector("content")?.getAttribute("src");
-            
             const contentSrcParts = contentSrcRaw ? contentSrcRaw.split('#') : [null, null];
-            const chapterFilePath = contentSrcParts[0] ? getAbsolutePath(tocPath, contentSrcParts[0]) : null;
-            const chapterAnchor = contentSrcParts[1] || undefined;
-
-            if (chapterTitleText && chapterTitleText.length > MAX_TITLE_LENGTH) {
-              console.warn(`  NCX NavPoint: タイトル候補 "${chapterTitleText.substring(0,50)}..." は長すぎます (${chapterTitleText.length}文字)。内容が混入している可能性があります。ファイル: ${chapterFilePath}. タイトルを短縮します。`);
-              chapterTitleText = chapterTitleText.substring(0, MAX_TITLE_LENGTH) + "...";
-            }
-            console.log(`  NCX NavPoint: title='${chapterTitleText}', contentSrcRaw='${contentSrcRaw}', resolvedChapterPath='${chapterFilePath}', anchor='${chapterAnchor}'`);
-            
-            if (chapterTitleText && chapterFilePath) {
-              const chapterFile = zip.file(chapterFilePath);
-              if (chapterFile) {
-                const chapterHtml = await chapterFile.async("string");
-                console.debug(`    章ファイル「${chapterFilePath}」ロード成功。HTML内容スニペット (先頭200文字):`, chapterHtml.substring(0,200)+"...");
-                
-                let extractedContent = extractCleanTextFromHtml(chapterHtml, chapterTitleText, chapterAnchor);
-                let finalContent = extractedContent;
-                const effectiveEmptyCheck = isEffectivelyEmpty(extractedContent, chapterTitleText);
-
-                if (effectiveEmptyCheck.empty) { // Check final extracted content (could be from anchor, siblings, or whole file)
-                    const reason = chapterAnchor ? `指定されたアンカー「#${chapterAnchor}」およびその後続要素からは抽出できませんでした (${effectiveEmptyCheck.reason})` 
-                                               : `ファイル全体から抽出できませんでした (${effectiveEmptyCheck.reason})`;
-                    console.warn(`    章「${chapterTitleText}」: ${reason}。ファイル: ${chapterFilePath}`);
-                    finalContent = `(このセクション「${chapterTitleText}」の具体的な内容は、${reason}。ファイル全体の内容を確認するか、手動で編集してください。)`;
-                }
-                chaptersWithContent.push({ title: chapterTitleText, content: finalContent });
-              } else {
-                console.warn(`    チャプターファイルが見つかりません: ${chapterFilePath} (タイトル: ${chapterTitleText})`);
-                chaptersWithContent.push({ title: chapterTitleText, content: "(内容が見つかりません)" });
-              }
-            } else {
-              console.warn("    NCX navPointにタイトルまたは有効なcontent srcがありませんでした。スキップします。");
-            }
-          }
+            itemsToProcess.push({
+                title: chapterTitleText,
+                filePath: contentSrcParts[0] ? getAbsolutePath(tocPath, contentSrcParts[0]) : null,
+                anchor: contentSrcParts[1] || undefined
+            });
+          });
         } else if (tocMediaType === "application/xhtml+xml" || tocMediaType === "text/html") { 
           console.log("EPUB3 NAV目次解析開始...");
-          let navLinksNodeList = tocDoc.querySelectorAll("nav[epub\\:type='toc'] a");
-          let selectorDescription = "nav[epub\\:type='toc'] a";
-          console.log(`NAV: 試行セレクタ '${selectorDescription}', 検出数: ${navLinksNodeList.length}`);
-
-          if (navLinksNodeList.length === 0) {
-            const fallbackSelector1 = "nav[role~='doc-toc'] a";
-            console.log(`NAV: '${selectorDescription}' で0件検出。フォールバックセレクタ '${fallbackSelector1}' で再試行します。`);
-            navLinksNodeList = tocDoc.querySelectorAll(fallbackSelector1);
-            selectorDescription = `${fallbackSelector1} (フォールバック1使用)`;
-            console.log(`NAV: 試行セレクタ '${selectorDescription}', 検出数: ${navLinksNodeList.length}`);
+          let navLinks = Array.from(tocDoc.querySelectorAll("nav[epub\\:type='toc'] a, nav[role~='doc-toc'] a"));
+          if (navLinks.length === 0) { 
+            navLinks = Array.from(tocDoc.querySelectorAll("body ol a, body ul a")); // Fallback
           }
-          
-          if (navLinksNodeList.length === 0) {
-            const fallbackSelector2 = "body ol a, body ul a"; 
-            console.log(`NAV: '${selectorDescription}' で0件検出。フォールバックセレクタ '${fallbackSelector2}' で再試行します。`);
-            navLinksNodeList = tocDoc.querySelectorAll(fallbackSelector2);
-            selectorDescription = `${fallbackSelector2} (フォールバック2使用)`;
-            console.log(`NAV: 試行セレクタ '${selectorDescription}', 検出数: ${navLinksNodeList.length}`);
-          }
-          
-          const navLinks = Array.from(navLinksNodeList);
           if (navLinks.length > 0) tocItemsFound = true;
-          console.log(`NAV: 最終的に ${navLinks.length}個のリンクを検出 (使用セレクタ: ${selectorDescription})`);
-          
-          for (const link of navLinks) {
-            let chapterTitleText = link.textContent?.trim();
+          navLinks.forEach(link => {
+            const chapterTitleText = link.textContent?.trim() || "無題の章";
             const hrefRaw = link.getAttribute("href");
-
             const hrefParts = hrefRaw ? hrefRaw.split('#') : [null, null];
-            const chapterFilePath = hrefParts[0] ? getAbsolutePath(tocPath, hrefParts[0]) : null;
-            const chapterAnchor = hrefParts[1] || undefined;
+            itemsToProcess.push({
+                title: chapterTitleText,
+                filePath: hrefParts[0] ? getAbsolutePath(tocPath, hrefParts[0]) : null,
+                anchor: hrefParts[1] || undefined
+            });
+          });
+        }
+        
+        let processedCount = 0;
+        for (const item of itemsToProcess) {
+          let chapterTitleText = item.title;
+          if (chapterTitleText && chapterTitleText.length > MAX_TITLE_LENGTH) {
+            chapterTitleText = chapterTitleText.substring(0, MAX_TITLE_LENGTH) + "...";
+          }
 
-            if (chapterTitleText && chapterTitleText.length > MAX_TITLE_LENGTH) {
-              console.warn(`  NAV Link: タイトル候補 "${chapterTitleText.substring(0,50)}..." は長すぎます (${chapterTitleText.length}文字)。内容が混入している可能性があります。ファイル: ${chapterFilePath}. タイトルを短縮します。`);
-              chapterTitleText = chapterTitleText.substring(0, MAX_TITLE_LENGTH) + "...";
-            }
-            console.log(`  NAV Link: title='${chapterTitleText}', hrefRaw='${hrefRaw}', resolvedChapterPath='${chapterFilePath}', anchor='${chapterAnchor}'`);
-            
-            if (chapterTitleText && chapterFilePath) {
-              const chapterFile = zip.file(chapterFilePath);
-              if (chapterFile) {
-                const chapterHtml = await chapterFile.async("string");
-                console.debug(`    章ファイル「${chapterFilePath}」ロード成功。HTML内容スニペット (先頭200文字):`, chapterHtml.substring(0,200)+"...");
-                
-                let extractedContent = extractCleanTextFromHtml(chapterHtml, chapterTitleText, chapterAnchor);
-                let finalContent = extractedContent;
-                const effectiveEmptyCheck = isEffectivelyEmpty(extractedContent, chapterTitleText);
+          if (chapterTitleText && item.filePath) {
+            const chapterFile = zip.file(item.filePath);
+            if (chapterFile) {
+              const fullFileHtml = await chapterFile.async("string");
+              let chapterSpecificContent = fullFileHtml; // Default to full content
 
-                if (effectiveEmptyCheck.empty) {
-                    const reason = chapterAnchor ? `指定されたアンカー「#${chapterAnchor}」およびその後続要素からは抽出できませんでした (${effectiveEmptyCheck.reason})` 
-                                               : `ファイル全体から抽出できませんでした (${effectiveEmptyCheck.reason})`;
-                    console.warn(`    章「${chapterTitleText}」: ${reason}。ファイル: ${chapterFilePath}`);
-                    finalContent = `(このセクション「${chapterTitleText}」の具体的な内容は、${reason}。ファイル全体の内容を確認するか、手動で編集してください。)`;
+              if (item.anchor) {
+                console.log(`  アンカー '${item.anchor}' を持つ章 '${item.title}' を処理中、ファイル: ${item.filePath}`);
+                const tempParser = new DOMParser();
+                const tempDoc = tempParser.parseFromString(fullFileHtml, 'text/html');
+                const anchoredElement = tempDoc.getElementById(item.anchor);
+
+                if (anchoredElement) {
+                  let extractedHtml = '';
+                  const parentOfAnchor = anchoredElement.parentElement;
+
+                  if (parentOfAnchor) {
+                      let currentNode: Element | null = anchoredElement;
+                      const elementsForSection: Element[] = [];
+
+                      while (currentNode) {
+                          elementsForSection.push(currentNode);
+                          const nextEl = currentNode.nextElementSibling;
+                          if (!nextEl) break; 
+
+                          const nextElId = nextEl.id;
+                          // Check if nextEl is an anchor for *another* TOC item within the same file
+                          const isNextElDifferentAnchor = itemsToProcess.some(
+                              tocItem => tocItem.filePath === item.filePath && tocItem.anchor && tocItem.anchor === nextElId && tocItem.anchor !== item.anchor
+                          );
+                          const isNextElHeading = ['H1', 'H2', 'H3', 'H4', 'H5', 'H6'].includes(nextEl.tagName.toUpperCase());
+
+                          if (isNextElHeading || isNextElDifferentAnchor) {
+                              break;
+                          }
+                          currentNode = nextEl;
+                      }
+                      
+                      const tempDiv = tempDoc.createElement('div');
+                      elementsForSection.forEach(el => tempDiv.appendChild(el.cloneNode(true)));
+                      extractedHtml = tempDiv.innerHTML;
+                  } else {
+                       extractedHtml = anchoredElement.outerHTML; // Fallback: just the element itself
+                  }
+                  
+                  if (extractedHtml.trim()) {
+                      chapterSpecificContent = extractedHtml;
+                      console.log(`    アンカー '${item.anchor}' の内容を抽出。新コンテンツ長: ${chapterSpecificContent.length}`);
+                  } else {
+                      console.warn(`    アンカー '${item.anchor}' から抽出された内容が空です。ファイル全体を使用します。`);
+                  }
+                } else { 
+                  console.warn(`    アンカー ID '${item.anchor}' がファイル '${item.filePath}' 内に見つかりませんでした。ファイル全体を使用します。`);
                 }
-                chaptersWithContent.push({ title: chapterTitleText, content: finalContent });
-              } else {
-                console.warn(`    チャプターファイルが見つかりません: ${chapterFilePath} (タイトル: ${chapterTitleText})`);
-                chaptersWithContent.push({ title: chapterTitleText, content: "(内容が見つかりません)" });
               }
+              
+              const contentWithEmbeddedImages = await processHtmlStringAndEmbedImages(chapterSpecificContent, item.filePath, zip, manifestByHref);
+              
+              chaptersWithContent.push({ 
+                title: chapterTitleText, 
+                content: contentWithEmbeddedImages,
+                isHtmlContent: true 
+              });
+              processedCount++;
             } else {
-               console.warn("    NAVリンクにタイトルまたは有効なhrefがありませんでした。スキップします。");
+              console.warn(`  章ファイルが見つかりません: ${item.filePath} (タイトル: ${chapterTitleText})`);
+              chaptersWithContent.push({ title: chapterTitleText, content: `<p>(内容ファイル ${item.filePath} が見つかりません)</p>`, isHtmlContent: true });
             }
+          } else {
+            console.warn("  目次アイテムにタイトルまたは有効なファイルパスがありませんでした。スキップします。", item);
           }
         }
+        console.log(`目次から ${processedCount} 個の章を処理しました。`);
       }
 
-      console.log("抽出された章の生データ (フィルタリング前):", chaptersWithContent.map(c => ({ title: c.title, contentLength: c.content.length, contentStart: c.content.substring(0,50)+"..." })));
 
       if (chaptersWithContent.length === 0) {
+        let specificError = "";
         if (!tocPath || !tocMediaType) { 
-             setError("EPUBから目次ファイル (NCX または NAV) を特定できませんでした。OPFファイルを確認してください。");
+             specificError = "EPUBから目次ファイル (NCX または NAV) を特定できませんでした。";
         } else if (tocPath && !tocItemsFound) { 
-             setError(`EPUBの目次ファイル (${tocPath}) は読み込めましたが、その中から章の項目を抽出できませんでした。目次構造が非標準であるか、空の目次です。ログを確認してください。`);
+             specificError = `EPUBの目次ファイル (${tocPath}) は読み込めましたが、章項目を抽出できませんでした。`;
         } else { 
-             setError("EPUB目次から章のタイトルや内容へのリンクを抽出できませんでした。目次の各項目に必要な情報が欠けている可能性があります。ログを確認してください。");
+             specificError = "EPUB目次から章のタイトルや内容を抽出できませんでした。";
         }
+        setError(specificError + " OPFと目次構造を確認してください。ログに詳細がある場合があります。");
         setInfoMessage(null);
       } else {
-        const validChapters = chaptersWithContent.filter(ch => 
-            ch.content !== "(内容が見つかりません)" && 
-            !(ch.content.startsWith("(このセクション「") || ch.content.startsWith("(この章「")) // Filter out our placeholder messages too for "valid"
-        ); 
-        // We still add chapters with placeholder messages to onAddChaptersBatch, so user sees them.
-        // The validChapters is more for internal logic/messaging about success rate.
+        onAddChaptersBatch(chaptersWithContent);
+        setInfoMessage(`${chaptersWithContent.length}個の章がEPUBから抽出・追加されました。画像も含まれている可能性があります。モーダルを閉じて内容を確認してください。`);
+        setContent(''); 
         
-        console.log("フィルタリング後の有効な章データ (プレースホルダ除く):", validChapters.map(c => ({ title: c.title, contentLength: c.content.length, contentStart: c.content.substring(0,50)+"..." })));
-        const chaptersToAdd = chaptersWithContent; // Add all, including those with placeholders
-
-        if (chaptersToAdd.length === 0) { // Should not happen if chaptersWithContent was not empty
-             setError("EPUBから有効な章を抽出できませんでした。目次やファイルの構造を確認してください。");
-             setInfoMessage(null);
-        } else {
-            onAddChaptersBatch(chaptersToAdd);
-            console.log(`バッチ追加完了: ${chaptersToAdd.length}個の章 (プレースホルダー含む)`);
-            setInfoMessage(`${chaptersToAdd.length}個の章がEPUBから抽出・追加されました。一部の章は内容抽出に失敗したためプレースホルダーが表示されている場合があります。モーダルを閉じて内容を確認してください。`);
-            setContent(''); 
-            
-            // Do not automatically close if there was an error message related to parsing.
-            // Only auto-close on full success without prior critical errors.
-            let shouldAutoClose = true;
-            if (error) { // if any error was set during parsing
-                const criticalErrorKeywords = ["特定できませんでした", "抽出できませんでした", "見つかりません"];
-                if (criticalErrorKeywords.some(keyword => error.includes(keyword))) {
-                    shouldAutoClose = false;
+        let shouldAutoClose = true;
+        if (error) { 
+            const criticalErrorKeywords = ["特定できませんでした", "抽出できませんでした", "見つかりません"];
+            if (criticalErrorKeywords.some(keyword => error.includes(keyword))) {
+                shouldAutoClose = false;
+            }
+        }
+        if (shouldAutoClose && !error) {
+            setTimeout(() => {
+                if (!isProcessingFile && infoMessage && infoMessage.includes("抽出・追加されました") && !error) {
+                    onClose();
                 }
-            }
-
-            if (shouldAutoClose) { 
-                setTimeout(() => {
-                    // Check again if the modal is still in a processing state or has a fresh error
-                    // This check is a bit redundant given the shouldAutoClose logic, but acts as a safeguard
-                    if (!isProcessingFile && infoMessage && infoMessage.includes("抽出・追加されました") && !error) {
-                        onClose();
-                    }
-                }, 2000);
-            }
+            }, 1500); 
         }
       }
 
@@ -449,7 +377,7 @@ const ChapterInputModal: React.FC<ChapterInputModalProps> = ({ onAddChapter, onA
   
   const currentContentPlaceholder = () => {
     if (isProcessingFile) return "EPUBから章を抽出中...";
-    return "ここに章のテキストを貼り付けるか、EPUBをアップロードしてください。";
+    return "ここに章のテキストを貼り付けるか、EPUBをアップロードしてください（手動追加用）。";
   };
   
   const manualSubmitButtonText = "手動でこの章を追加";
@@ -479,7 +407,7 @@ const ChapterInputModal: React.FC<ChapterInputModalProps> = ({ onAddChapter, onA
         <form onSubmit={handleSubmit} className="space-y-4 flex-grow flex flex-col overflow-hidden">
           <div>
             <label htmlFor="chapterTitle" className="block text-sm font-medium text-gray-300 mb-1">
-              章のタイトル (手動追加／EPUBからの抽出結果)
+              章のタイトル (手動追加／EPUBからのメインタイトル)
             </label>
             <input
               type="text"
@@ -487,7 +415,7 @@ const ChapterInputModal: React.FC<ChapterInputModalProps> = ({ onAddChapter, onA
               value={title}
               onChange={(e) => setTitle(e.target.value)}
               className="w-full bg-gray-700 text-gray-100 border border-gray-600 rounded-md p-2.5 focus:ring-sky-500 focus:border-sky-500 shadow-sm"
-              placeholder="例：第1章：始まり（EPUBアップロードで自動入力）"
+              placeholder="例：第1章：始まり（EPUBアップロードで自動入力される場合あり）"
               disabled={isProcessingFile}
             />
           </div>
@@ -495,7 +423,7 @@ const ChapterInputModal: React.FC<ChapterInputModalProps> = ({ onAddChapter, onA
           <div className="mb-1 space-y-3">
             <div>
                 <label htmlFor="epubUpload" className="block text-sm font-medium text-gray-300 mb-1">
-                EPUBをアップロード (章の自動抽出用)
+                EPUBをアップロード (章と画像の自動抽出用)
                 </label>
                 <div className="flex items-center space-x-2">
                     <input
@@ -520,7 +448,7 @@ const ChapterInputModal: React.FC<ChapterInputModalProps> = ({ onAddChapter, onA
                     {(isProcessingFile) && <LoadingSpinner size="sm" color="text-indigo-400"/>}
                 </div>
                 <p id="epubUploadHelp" className="mt-1 text-xs text-gray-400">
-                EPUBをアップロードすると、章が自動的に抽出されリストに追加されます。
+                EPUBをアップロードすると、章が自動的に抽出されリストに追加されます。画像も可能な範囲で埋め込まれます。
                 </p>
             </div>
           </div>
