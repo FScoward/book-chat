@@ -1,38 +1,18 @@
-
 import React, { useState, useEffect, useCallback, useRef } from 'react';
 import { Chapter, Message } from './types';
-import { getGenAI, startNewChatSession, sendMessage as sendGeminiMessage, ChapterWithContent } from './services/geminiService';
+import { getGenAI, startNewChatSession, sendMessage as sendGeminiMessage, ChapterWithContent, prepareTextForReadAloud } from './services/geminiService';
+import { generateSpeech, playAudio } from './services/ttsService';
 import ChapterList from './components/ChapterList';
 import ChapterContentView from './components/ChapterContentView';
 import ChatView from './components/ChatView';
 import ChapterInputModal from './components/ChapterInputModal';
 import AlertMessage from './components/AlertMessage';
-import { PlusIcon, BookOpenIcon, ChatBubbleLeftRightIcon, XMarkIcon, Cog6ToothIcon } from './components/Icons';
+import FontSizeControl from './components/FontSizeControl'; // New Import
+import { PlusIcon, BookOpenIcon, ChatBubbleLeftRightIcon, XMarkIcon } from './components/Icons';
+import { AudioPlayer } from './components/AudioPlayer';
 
 const READ_STATUS_LOCAL_STORAGE_KEY = 'bookChatAi_readStatus_v1';
-const SELECTED_MODEL_LOCAL_STORAGE_KEY = 'bookChatAi_selectedModel_v1_object'; // Changed key name for new structure
-
-export interface ModelDefinition {
-  id: string; // e.g., 'gemini-2.5-flash-preview-04-17' or 'gpt-4o'
-  name: string; // e.g., 'Gemini 2.5 Flash Preview' or 'OpenAI GPT-4o (Not Functional)'
-  apiProvider: 'gemini' | 'openai';
-  isDefault?: boolean;
-}
-
-export const AVAILABLE_MODELS: ModelDefinition[] = [
-  { id: 'gemini-2.5-flash-preview-04-17', name: 'Gemini 2.5 Flash (04-17)', apiProvider: 'gemini', isDefault: true },
-  { id: 'imagen-3.0-generate-002', name: 'Gemini Imagen 3.0 (画像生成)', apiProvider: 'gemini' },
-  // OpenAI models - these will be listed but are not functional with the current Gemini-focused backend
-  { id: 'gpt-4o', name: 'OpenAI GPT-4o (非機能)', apiProvider: 'openai' },
-  { id: 'gpt-4-turbo', name: 'OpenAI GPT-4 Turbo (非機能)', apiProvider: 'openai' },
-  { id: 'gpt-3.5-turbo', name: 'OpenAI GPT-3.5 Turbo (非機能)', apiProvider: 'openai' },
-];
-
-const getDefaultModelId = (): string => {
-  const defaultModel = AVAILABLE_MODELS.find(model => model.isDefault);
-  return defaultModel ? defaultModel.id : AVAILABLE_MODELS[0].id;
-};
-
+const FONT_SIZE_CLASS_LOCAL_STORAGE_KEY = 'bookChatAi_fontSizeClass_v1'; // New Key
 
 const loadReadStatusFromLocalStorage = (): { [id: string]: boolean } => {
   try {
@@ -52,23 +32,21 @@ const saveReadStatusToLocalStorage = (readStatus: { [id: string]: boolean }) => 
   }
 };
 
-const loadSelectedModelFromLocalStorage = (): string => {
+const loadFontSizeClassFromLocalStorage = (): string => {
   try {
-    const storedModelId = localStorage.getItem(SELECTED_MODEL_LOCAL_STORAGE_KEY);
-    if (storedModelId && AVAILABLE_MODELS.some(model => model.id === storedModelId)) {
-      return storedModelId;
-    }
+    const storedClass = localStorage.getItem(FONT_SIZE_CLASS_LOCAL_STORAGE_KEY);
+    return storedClass && ['text-sm', 'text-base', 'text-lg'].includes(storedClass) ? storedClass : 'text-base';
   } catch (error) {
-    console.error("Error loading selected model ID from localStorage:", error);
+    console.error("Error loading font size class from localStorage:", error);
+    return 'text-base';
   }
-  return getDefaultModelId();
 };
 
-const saveSelectedModelToLocalStorage = (modelId: string) => {
+const saveFontSizeClassToLocalStorage = (fontSizeClass: string) => {
   try {
-    localStorage.setItem(SELECTED_MODEL_LOCAL_STORAGE_KEY, modelId);
+    localStorage.setItem(FONT_SIZE_CLASS_LOCAL_STORAGE_KEY, fontSizeClass);
   } catch (error) {
-    console.error("Error saving selected model ID to localStorage:", error);
+    console.error("Error saving font size class to localStorage:", error);
   }
 };
 
@@ -81,15 +59,18 @@ const App: React.FC = () => {
   const [error, setError] = useState<string | null>(null);
   const [isApiKeyOk, setIsApiKeyOk] = useState<boolean>(false);
   const [showAddChapterModal, setShowAddChapterModal] = useState<boolean>(false);
-  const [selectedModelId, setSelectedModelId] = useState<string>(loadSelectedModelFromLocalStorage());
+  const [fontSizeClass, setFontSizeClass] = useState<string>(loadFontSizeClassFromLocalStorage());
+  const [isPlayingAudio, setIsPlayingAudio] = useState<boolean>(false);
+  const audioContextRef = useRef<AudioContext | null>(null);
+  const [currentAudioBuffer, setCurrentAudioBuffer] = useState<ArrayBuffer | null>(null);
 
   useEffect(() => {
     try {
-      getGenAI(); // This checks for process.env.API_KEY for Gemini
+      getGenAI();
       setIsApiKeyOk(true);
     } catch (e) {
       if (e instanceof Error) {
-        setError(`初期化に失敗しました：${e.message}。Gemini API用の API_KEY 環境変数が正しく設定されていることを確認してください。`);
+        setError(`初期化に失敗しました：${e.message}。API_KEY 環境変数が正しく設定されていることを確認してください。`);
       } else {
         setError("不明な初期化エラーが発生しました。");
       }
@@ -97,47 +78,26 @@ const App: React.FC = () => {
     }
   }, []);
 
-  const handleModelChange = (event: React.ChangeEvent<HTMLSelectElement>) => {
-    const newModelId = event.target.value;
-    setSelectedModelId(newModelId);
-    saveSelectedModelToLocalStorage(newModelId);
-    setError(null); 
-  };
+  useEffect(() => {
+    document.body.classList.remove('text-sm', 'text-base', 'text-lg');
+    document.body.classList.add(fontSizeClass);
+    saveFontSizeClassToLocalStorage(fontSizeClass);
+  }, [fontSizeClass]);
 
   const handleSelectChapter = useCallback(async (chapterId: string, chapterContentParam?: string) => {
     setActiveChapterId(chapterId);
     setError(null);
     const chapterToUpdate = chapters.find(chap => chap.id === chapterId);
-    const currentSelectedModelDefinition = AVAILABLE_MODELS.find(m => m.id === selectedModelId);
-
-    if (currentSelectedModelDefinition?.apiProvider === 'openai') {
-      setError(`選択されたモデル (${currentSelectedModelDefinition.name}) はOpenAIモデルです。このアプリケーションは現在Gemini APIにのみ対応しているため、チャットを開始できません。Geminiモデルを選択してください。`);
-      setChapters(prevChapters =>
-        prevChapters.map(chap =>
-          chap.id === chapterId
-            ? { ...chap, messages: [{
-                id: crypto.randomUUID(),
-                role: 'model',
-                text: `エラー：OpenAIモデル (${currentSelectedModelDefinition.name}) は現在サポートされていません。Geminiモデルを選択してください。`,
-                timestamp: new Date()
-              }] }
-            : chap
-        )
-      );
-      setIsInitializingChat(false);
-      return;
-    }
 
     if (chapterToUpdate && !chapterToUpdate.chatInstance) {
       if (!isApiKeyOk) {
-        setError("チャットセッションを開始できません：Gemini APIキーが利用できません。");
+        setError("チャットセッションを開始できません：APIキーが利用できません。");
         return;
       }
       setIsInitializingChat(true);
       try {
         const currentContent = chapterContentParam || chapterToUpdate.content;
-        // Pass selectedModelId (which should be a Gemini model ID here)
-        const chat = startNewChatSession(currentContent, selectedModelId);
+        const chat = startNewChatSession(currentContent);
 
         const initialUserPrompt = "この章について議論を始めてください。";
         const initialAiResponseText = await sendGeminiMessage(chat, initialUserPrompt);
@@ -175,7 +135,7 @@ const App: React.FC = () => {
         setIsInitializingChat(false);
       }
     }
-  }, [isApiKeyOk, chapters, selectedModelId]);
+  }, [isApiKeyOk, chapters]);
 
   const handleToggleReadStatus = useCallback((chapterId: string) => {
     setChapters(prevChapters =>
@@ -250,26 +210,9 @@ const App: React.FC = () => {
 
     const activeChapter = chapters.find(c => c.id === activeChapterId);
     if (!activeChapter || !activeChapter.chatInstance) {
-       const currentSelectedModelDefinition = AVAILABLE_MODELS.find(m => m.id === selectedModelId);
-       if (currentSelectedModelDefinition?.apiProvider === 'openai') {
-         setError(`選択されたモデル (${currentSelectedModelDefinition.name}) はOpenAIモデルです。このアプリケーションは現在Gemini APIにのみ対応しているため、メッセージを送信できません。Geminiモデルを選択してください。`);
-       } else {
-         setError("アクティブな章またはチャットセッションが見つかりません。AIペルソナが初期化されていない可能性があります。");
-       }
+      setError("アクティブな章またはチャットセッションが見つかりません。AIペルソナが初期化されていない可能性があります。");
       return;
     }
-    
-    // Check again before sending, in case model was changed after chat init
-    const currentSelectedModelDefinition = AVAILABLE_MODELS.find(m => m.id === selectedModelId);
-    if (currentSelectedModelDefinition?.apiProvider === 'openai' && activeChapter.chatInstance) {
-        // If chatInstance exists, it must be a Gemini chat. But selected model is OpenAI.
-        // This is a confusing state. For now, we'll prevent sending.
-        // Or, we could allow sending to the existing Gemini chat, regardless of current dropdown.
-        // Let's prevent to be less confusing and enforce the error message more strictly.
-        setError(`現在選択されているモデル (${currentSelectedModelDefinition.name}) はOpenAIモデルです。既存のGeminiチャットセッションには送信できません。Geminiモデルを選択し直してください。`);
-        return;
-    }
-
 
     const userMessage: Message = {
       id: crypto.randomUUID(),
@@ -316,7 +259,7 @@ const App: React.FC = () => {
     } finally {
       setIsLoading(false);
     }
-  }, [activeChapterId, chapters, selectedModelId]);
+  }, [activeChapterId, chapters]);
 
   const handleDeleteChapter = useCallback((chapterId: string) => {
     setChapters(prevChapters => prevChapters.filter(chap => chap.id !== chapterId));
@@ -328,13 +271,29 @@ const App: React.FC = () => {
     saveReadStatusToLocalStorage(currentReadStatus);
   }, [activeChapterId]);
 
+  const handlePlayAudio = async (text: string) => {
+    if (!isApiKeyOk) {
+      setError("音声再生を開始できません：APIキーが利用できません。");
+      return;
+    }
+
+    setError(null);
+    try {
+      const audioText = text.replace(/[「」]/g, '');
+      const audioBuffer = await generateSpeech(audioText);
+      setCurrentAudioBuffer(audioBuffer);
+    } catch (error) {
+      console.error('音声の生成に失敗しました:', error);
+      setError('音声の生成に失敗しました。');
+    }
+  };
 
   const activeChapter = chapters.find(c => c.id === activeChapterId);
 
   if (!isApiKeyOk) {
     return (
       <div className="flex items-center justify-center h-screen bg-gray-900 text-white p-4">
-        <AlertMessage type="error" message={error || "Gemini APIキーが設定されていません。"} />
+        <AlertMessage type="error" message={error || "APIキーが設定されていません。"} />
       </div>
     );
   }
@@ -342,7 +301,7 @@ const App: React.FC = () => {
   return (
     <div className="absolute inset-0 flex bg-gray-900 text-gray-100 font-sans overflow-hidden">
       {/* Sidebar */}
-      <aside className="w-72 bg-gray-800 p-4 space-y-6 flex flex-col shadow-lg">
+      <aside className="w-72 bg-gray-800 p-4 space-y-4 flex flex-col shadow-lg"> {/* Reduced space-y slightly */}
         <h1 className="text-2xl font-bold text-sky-400 flex items-center">
           <ChatBubbleLeftRightIcon className="w-8 h-8 mr-2" />
           ブックチャットAI
@@ -363,30 +322,10 @@ const App: React.FC = () => {
             onToggleReadStatus={handleToggleReadStatus}
           />
         </div>
-        
-        <div className="mt-auto pt-4 border-t border-gray-700">
-          <label htmlFor="modelSelector" className="flex items-center text-sm font-medium text-gray-300 mb-1">
-            <Cog6ToothIcon className="w-5 h-5 mr-2 text-gray-400" />
-            AIモデル設定
-          </label>
-          <select
-            id="modelSelector"
-            value={selectedModelId}
-            onChange={handleModelChange}
-            className="w-full bg-gray-700 text-gray-200 border border-gray-600 rounded-md p-2.5 focus:ring-sky-500 focus:border-sky-500 shadow-sm text-xs appearance-none"
-            aria-label="使用するAIモデルを選択"
-          >
-            {AVAILABLE_MODELS.map(model => (
-              <option key={model.id} value={model.id} disabled={model.apiProvider === 'openai' && model.name.includes('非機能')}>
-                {model.name}
-              </option>
-            ))}
-          </select>
-          <p className="mt-1.5 text-xs text-gray-400 leading-tight">
-            <strong>Geminiモデル:</strong> <code className="bg-gray-600 px-1 rounded">gemini-2.5-flash-preview-04-17</code> (テキスト推奨) などは、設定済みのGemini APIキーで動作します。<br/>
-            <strong>OpenAIモデル (非機能):</strong> OpenAIのモデル (例: GPT-4o) はリストに表示されていますが、このアプリケーションの現在のバックエンド (Gemini API専用) では**動作しません**。選択するとエラーが発生します。OpenAIモデルの利用にはアプリの大幅な改修が必要です。
-          </p>
-        </div>
+        <FontSizeControl
+          currentFontSizeClass={fontSizeClass}
+          onChangeFontSizeClass={setFontSizeClass}
+        />
       </aside>
 
       {/* Main Content */}
@@ -423,8 +362,21 @@ const App: React.FC = () => {
                 isLoading={isLoading || isInitializingChat}
                 chapterTitle={activeChapter.title}
                 chapterContent={activeChapter.content}
-                selectedModelId={selectedModelId} 
-              />
+                onPlayAudio={handlePlayAudio}
+                isPlayingAudio={isPlayingAudio}
+              >
+                {currentAudioBuffer && (
+                  <div className="mt-4">
+                    <AudioPlayer
+                      audioBuffer={currentAudioBuffer}
+                      fileName={`${activeChapter?.title || 'chapter'}_${new Date().toISOString().slice(0, 10)}.wav`}
+                      onPlay={() => console.log('再生開始')}
+                      onPause={() => console.log('一時停止')}
+                      onEnd={() => console.log('再生終了')}
+                    />
+                  </div>
+                )}
+              </ChatView>
             </section>
           </div>
         )}

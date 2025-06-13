@@ -1,26 +1,40 @@
-
 import React, { useState, useEffect, useRef, useCallback } from 'react';
 import { Message } from '../types';
 import LoadingSpinner from './LoadingSpinner';
-import { PaperAirplaneIcon, UserCircleIcon, SparklesIcon, SpeakerWaveIcon } from './Icons';
-import { generateConversationalCommentary, extractKeywordsFromDiscussion } from '../services/geminiService';
-import { AVAILABLE_MODELS } from '../App'; // Import AVAILABLE_MODELS
+import { PaperAirplaneIcon, UserCircleIcon, SparklesIcon, SpeakerWaveIcon, PlayIcon, PauseIcon, StopIcon } from './Icons';
+import { generateConversationalCommentary, extractKeywordsFromDiscussion, prepareTextForReadAloud } from '../services/geminiService';
 
 interface ChatViewProps {
   messages: Message[];
-  onSendMessage: (messageText: string) => void;
+  onSendMessage: (messageText: string) => Promise<void>;
   isLoading: boolean;
-  chapterTitle?: string;
+  chapterTitle: string;
   chapterContent: string;
-  selectedModelId: string; // Changed prop name
+  onPlayAudio: (text: string) => Promise<void>;
+  isPlayingAudio: boolean;
+  children?: React.ReactNode;
 }
 
-const ChatView: React.FC<ChatViewProps> = ({ messages, onSendMessage, isLoading, chapterTitle, chapterContent, selectedModelId }) => {
+const ChatView: React.FC<ChatViewProps> = ({
+  messages,
+  onSendMessage,
+  isLoading,
+  chapterTitle,
+  chapterContent,
+  onPlayAudio,
+  isPlayingAudio,
+  children
+}) => {
   const [inputText, setInputText] = useState('');
   const messagesEndRef = useRef<HTMLDivElement>(null);
 
-  const [isProcessingAudioAction, setIsProcessingAudioAction] = useState<boolean>(false);
-  const [audioFeatureMessage, setAudioFeatureMessage] = useState<string | null>(null);
+  const [isPreparingCommentarySpeech, setIsPreparingCommentarySpeech] = useState<boolean>(false);
+  const [isCommentarySpeaking, setIsCommentarySpeaking] = useState<boolean>(false);
+  const [isCommentaryPaused, setIsCommentaryPaused] = useState<boolean>(false);
+  const [commentarySpeechError, setCommentarySpeechError] = useState<string | null>(null);
+  const commentaryUtteranceRef = useRef<SpeechSynthesisUtterance | null>(null);
+  const preparedCommentaryTextRef = useRef<string | null>(null);
+
 
   const [extractedTags, setExtractedTags] = useState<string[]>([]);
   const [isExtractingTags, setIsExtractingTags] = useState<boolean>(false);
@@ -32,29 +46,29 @@ const ChatView: React.FC<ChatViewProps> = ({ messages, onSendMessage, isLoading,
 
   useEffect(scrollToBottom, [messages]);
 
-  useEffect(() => {
+  useEffect(() => { 
     return () => {
-      setAudioFeatureMessage(null);
+      if (window.speechSynthesis.speaking || window.speechSynthesis.pending) {
+         // Cancelling all speech on chapter change, assuming commentary belongs to the chapter.
+         window.speechSynthesis.cancel();
+      }
+      setIsCommentarySpeaking(false);
+      setIsCommentaryPaused(false);
+      setCommentarySpeechError(null);
+      commentaryUtteranceRef.current = null;
+      preparedCommentaryTextRef.current = null;
     };
-  }, [chapterTitle]);
+  }, [chapterTitle]); 
 
   useEffect(() => {
     const fetchTags = async () => {
       const lastAiMessage = messages.filter(m => m.role === 'model').pop();
-      const currentSelectedModelDefinition = AVAILABLE_MODELS.find(m => m.id === selectedModelId);
 
-      if (currentSelectedModelDefinition?.apiProvider === 'openai') {
-        setTagExtractionError("OpenAIモデルではキーワード抽出は利用できません。");
-        setExtractedTags([]);
-        setIsExtractingTags(false);
-        return;
-      }
-
-      if (lastAiMessage && lastAiMessage.text.trim() !== '' && !isLoading && !isProcessingAudioAction) {
+      if (lastAiMessage && lastAiMessage.text.trim() !== '' && !isLoading && !isPreparingCommentarySpeech) {
         setIsExtractingTags(true);
         setTagExtractionError(null); 
         try {
-          const tags = await extractKeywordsFromDiscussion(lastAiMessage.text, selectedModelId);
+          const tags = await extractKeywordsFromDiscussion(lastAiMessage.text);
           setExtractedTags(tags);
         } catch (e) {
           const errorMsg = e instanceof Error ? e.message : "タグの抽出中に不明なエラーが発生しました。";
@@ -64,62 +78,145 @@ const ChatView: React.FC<ChatViewProps> = ({ messages, onSendMessage, isLoading,
         } finally {
           setIsExtractingTags(false);
         }
-      } else if (!isLoading && !isProcessingAudioAction) { 
+      } else if (!isLoading && !isPreparingCommentarySpeech) { 
         setExtractedTags([]);
         setTagExtractionError(null);
       }
     };
 
     fetchTags();
-  }, [messages, chapterTitle, isLoading, isProcessingAudioAction, selectedModelId]);
+  // eslint-disable-next-line react-hooks/exhaustive-deps  
+  }, [messages, chapterTitle, isLoading, isPreparingCommentarySpeech]);
 
 
-  const handleAudioCommentaryAction = async () => {
+  const handleGenerateAndPlayAudioCommentary = async () => {
     if (!chapterContent) {
-      setAudioFeatureMessage("解説のための章の内容がありません。");
+      setCommentarySpeechError("解説のための章の内容がありません。");
       return;
     }
+    if (isPreparingCommentarySpeech) return;
+    // Do not check window.speechSynthesis.speaking here, as we will cancel it.
 
-    const currentSelectedModelDefinition = AVAILABLE_MODELS.find(m => m.id === selectedModelId);
-    if (currentSelectedModelDefinition?.apiProvider === 'openai') {
-      setAudioFeatureMessage(
-        `OpenAIモデル (${currentSelectedModelDefinition.name}) では音声解説機能は利用できません。Geminiモデルを選択してください。`
-      );
-      return;
-    }
-    
-    setIsProcessingAudioAction(true);
-    setAudioFeatureMessage(null);
+
+    setIsPreparingCommentarySpeech(true);
+    setCommentarySpeechError(null);
+    preparedCommentaryTextRef.current = null;
 
     try {
-      // const ssmlText = await generateConversationalCommentary(chapterContent, selectedModelId);
-      // console.log("Generated SSML for commentary (TTS feature unavailable):", ssmlText);
+      console.log("Generating conversational commentary script...");
+      const conversationalScript = await generateConversationalCommentary(chapterContent);
 
-      setAudioFeatureMessage(
-        `音声解説機能は、現在の設定ではご利用いただけません (Gemini TTS API別途設定要)。\n（内部処理: 選択されたGeminiモデル「${selectedModelId}」でSSMLスクリプト生成試行）`
-      );
+      if (!conversationalScript.trim()) {
+        setCommentarySpeechError("AIによって生成された解説スクリプトが空です。");
+        setIsPreparingCommentarySpeech(false);
+        return;
+      }
+      
+      console.log("Preparing commentary script for read aloud...");
+      const preparedScript = await prepareTextForReadAloud(conversationalScript);
+       if (!preparedScript.trim()) {
+        setCommentarySpeechError("AIによるテキスト整形後、読み上げる解説スクリプトが空になりました。");
+        setIsPreparingCommentarySpeech(false);
+        return;
+      }
+      preparedCommentaryTextRef.current = preparedScript;
+
+      const utterance = new SpeechSynthesisUtterance(preparedScript);
+      utterance.lang = 'ja-JP';
+      utterance.onstart = () => {
+        setIsCommentarySpeaking(true);
+        setIsCommentaryPaused(false);
+        setCommentarySpeechError(null);
+      };
+      utterance.onpause = () => {
+        setIsCommentaryPaused(true);
+      };
+      utterance.onresume = () => {
+        setIsCommentaryPaused(false);
+      };
+      utterance.onend = () => {
+        setIsCommentarySpeaking(false);
+        setIsCommentaryPaused(false);
+        commentaryUtteranceRef.current = null;
+      };
+      utterance.onerror = (event) => {
+        console.error("Commentary speech synthesis error:", event);
+        setCommentarySpeechError(`音声解説エラー：${event.error}`);
+        setIsCommentarySpeaking(false);
+        setIsCommentaryPaused(false);
+        commentaryUtteranceRef.current = null;
+      };
+      
+      commentaryUtteranceRef.current = utterance;
+      window.speechSynthesis.cancel(); // Ensure any prior speech is stopped
+      window.speechSynthesis.speak(utterance);
+
     } catch (e) {
-        const errorMsg = e instanceof Error ? e.message : "SSML生成中に不明なエラーが発生しました。";
-        setAudioFeatureMessage(`音声解説用SSMLの生成に失敗しました (使用モデル: ${selectedModelId}): ${errorMsg}`);
-        console.error("Error in handleAudioCommentaryAction (SSML generation):", e);
+      const errorMsg = e instanceof Error ? e.message : "不明なエラーが発生しました。";
+      console.error("音声解説の準備または再生に失敗しました:", e);
+      setCommentarySpeechError(`音声解説準備エラー：${errorMsg}`);
     } finally {
-      setIsProcessingAudioAction(false);
+      setIsPreparingCommentarySpeech(false);
     }
   };
   
 
+  const handlePlayPauseAudioCommentary = () => {
+     if (isPreparingCommentarySpeech) return;
+
+    if (window.speechSynthesis.speaking) {
+      // Check if the currently speaking/paused utterance is our commentary one by checking the ref
+      if (commentaryUtteranceRef.current && (window.speechSynthesis.paused === isCommentaryPaused) ) {
+          if (isCommentaryPaused) {
+            window.speechSynthesis.resume();
+          } else {
+            window.speechSynthesis.pause();
+          }
+      } else {
+          // Another speech is active or state is inconsistent, stop it and start ours
+          window.speechSynthesis.cancel(); 
+          handleGenerateAndPlayAudioCommentary(); 
+      }
+    } else if (preparedCommentaryTextRef.current && commentaryUtteranceRef.current) {
+        if(!commentaryUtteranceRef.current.text || commentaryUtteranceRef.current.onend === null) {
+            window.speechSynthesis.cancel();
+            handleGenerateAndPlayAudioCommentary();
+        } else {
+            window.speechSynthesis.cancel();
+            window.speechSynthesis.speak(commentaryUtteranceRef.current);
+        }
+    } else {
+      window.speechSynthesis.cancel();
+      handleGenerateAndPlayAudioCommentary();
+    }
+  };
+
+  const handleStopAudioCommentary = () => {
+    if (window.speechSynthesis.speaking || window.speechSynthesis.pending) {
+       window.speechSynthesis.cancel();
+    }
+    setIsCommentarySpeaking(false);
+    setIsCommentaryPaused(false);
+    if (commentaryUtteranceRef.current) {
+        commentaryUtteranceRef.current.onstart = null;
+        commentaryUtteranceRef.current.onpause = null;
+        commentaryUtteranceRef.current.onresume = null;
+        commentaryUtteranceRef.current.onend = null;
+        commentaryUtteranceRef.current.onerror = null;
+    }
+  };
+  
   const handleSubmit = (e: React.FormEvent) => {
     e.preventDefault();
-    const currentSelectedModelDefinition = AVAILABLE_MODELS.find(m => m.id === selectedModelId);
-    if (currentSelectedModelDefinition?.apiProvider === 'openai') {
-        setTagExtractionError(null); // Clear previous errors
-        setAudioFeatureMessage(`OpenAIモデル (${currentSelectedModelDefinition.name}) でメッセージを送信することはできません。Geminiモデルを選択してください。`);
-        return;
-    }
-    if (inputText.trim() && !isLoading && !isProcessingAudioAction && !isExtractingTags) {
+    if (inputText.trim() && !isLoading) {
       onSendMessage(inputText.trim());
       setInputText('');
-      setAudioFeatureMessage(null); // Clear audio/OpenAI related messages on successful send
+    }
+  };
+
+  const handlePlayMessage = async (text: string) => {
+    if (!isLoading && !isPlayingAudio) {
+      await onPlayAudio(text);
     }
   };
 
@@ -160,126 +257,79 @@ const ChatView: React.FC<ChatViewProps> = ({ messages, onSendMessage, isLoading,
               </p>
             );
           }
-          // Default styling for lines that don't match Analyst/Explorer
-          // This ensures error messages or other AI responses are still displayed.
-           return <p key={lineKey} className="my-1 text-gray-200">{highlightQuotedText(line, `${lineKey}-default`)}</p>;
+          return <p key={lineKey} className="my-1 text-gray-200">{highlightQuotedText(line, `${lineKey}-default`)}</p>;
         })}
       </>
     );
   };
 
+  const isCommentaryPlayButtonActive = isCommentarySpeaking && !isCommentaryPaused;
 
   return (
-    <div className="h-full flex flex-col bg-gray-800 text-gray-100">
-      <div className="p-4 border-b border-gray-700">
-        <div className="flex justify-between items-center mb-2">
-          <h3 className="text-lg font-semibold text-sky-400">
-            AIディスカッション：{chapterTitle || "現在の章"}
-          </h3>
-          <div className="flex items-center space-x-2">
-            <button
-              onClick={handleAudioCommentaryAction}
-              disabled={isProcessingAudioAction || !chapterContent || isLoading || isExtractingTags}
-              className="p-2 rounded-full hover:bg-gray-700 disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
-              title="章のAI音声解説について (情報)"
-              aria-label="音声解説機能の情報表示"
+    <div className="flex flex-col h-full">
+      <div className="flex-1 overflow-y-auto mb-4 space-y-4">
+        {messages.map((message) => (
+          <div
+            key={message.id}
+            className={`flex ${
+              message.role === 'user' ? 'justify-end' : 'justify-start'
+            }`}
+          >
+            <div
+              className={`max-w-[80%] rounded-lg p-4 ${
+                message.role === 'user'
+                  ? 'bg-sky-600 text-white'
+                  : 'bg-gray-700 text-gray-100'
+              }`}
             >
-              {isProcessingAudioAction ? <LoadingSpinner size="xs" /> : <SpeakerWaveIcon className="w-5 h-5 text-sky-400" />}
-            </button>
-          </div>
-        </div>
-        
-        <div className="flex flex-wrap items-center gap-2 min-h-[20px]">
-          {isExtractingTags && <LoadingSpinner size="xs" />}
-          {tagExtractionError && !isExtractingTags && (
-            <p className="text-xs text-red-400" role="alert">
-              タグ抽出エラー: {tagExtractionError.length > 50 ? tagExtractionError.substring(0,50) + "..." : tagExtractionError}
-            </p>
-          )}
-          {!isExtractingTags && !tagExtractionError && extractedTags.length > 0 && (
-            extractedTags.map(tag => (
-              <span 
-                key={tag} 
-                className="bg-gray-600 text-gray-200 text-xs px-2.5 py-1 rounded-full shadow"
-                title={tag}
-              >
-                {tag.length > 20 ? tag.substring(0, 18) + "..." : tag}
-              </span>
-            ))
-          )}
-          {!isExtractingTags && !tagExtractionError && extractedTags.length === 0 && messages.some(m => m.role === 'model') && !isLoading && (
-            <p className="text-xs text-gray-500">関連タグはありません。</p>
-          )}
-        </div>
-
-        {audioFeatureMessage && <p className="text-xs text-yellow-300 bg-yellow-700 bg-opacity-40 p-2 rounded mt-1 whitespace-pre-line" role="status">{audioFeatureMessage}</p>}
-      </div>
-      
-      <div className="flex-grow overflow-y-auto p-4 space-y-4 min-h-0">
-        {messages.map((msg) => (
-          <div key={msg.id} className={`flex ${msg.role === 'user' ? 'justify-end' : 'justify-start'}`}>
-            <div className={`flex items-start max-w-xl ${msg.role === 'user' ? 'flex-row-reverse' : 'flex-row'}`}>
-              {msg.role === 'model' && <SparklesIcon className="w-8 h-8 p-1.5 rounded-full bg-gray-600 text-sky-300 mr-2 flex-shrink-0" aria-hidden="true" />}
-              {msg.role === 'user' && <UserCircleIcon className="w-8 h-8 p-1.5 rounded-full bg-indigo-500 text-white ml-2 flex-shrink-0" aria-hidden="true" />}
-              <div
-                className={`px-4 py-2.5 rounded-xl shadow ${
-                  msg.role === 'user'
-                    ? 'bg-indigo-600 text-white rounded-br-none'
-                    : 'bg-gray-700 text-gray-200 rounded-bl-none'
-                }`}
-                style={{ whiteSpace: 'pre-wrap', wordBreak: 'break-word' }}
-              >
-                {msg.role === 'model' ? renderModelMessageContent(msg.id, msg.text) : <p className="text-gray-100">{msg.text}</p>}
-                 <p className="text-xs opacity-60 mt-1.5 text-right">
-                    {new Date(msg.timestamp).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}
-                </p>
+              <div className="flex items-start gap-2">
+                {message.role === 'user' ? (
+                  <UserCircleIcon className="w-6 h-6 flex-shrink-0" />
+                ) : (
+                  <SparklesIcon className="w-6 h-6 flex-shrink-0" />
+                )}
+                <div className="flex-1">
+                  {message.role === 'model' ? (
+                    renderModelMessageContent(message.id, message.text)
+                  ) : (
+                    <p>{message.text}</p>
+                  )}
+                  <div className="flex justify-end mt-2">
+                    <button
+                      onClick={() => handlePlayMessage(message.text)}
+                      className="text-gray-300 hover:text-white"
+                      title="音声で再生"
+                    >
+                      <SpeakerWaveIcon className="w-5 h-5" />
+                    </button>
+                  </div>
+                </div>
               </div>
             </div>
           </div>
         ))}
-        {isLoading && messages.length > 0 && messages[messages.length-1].role === 'user' && (
-          <div className="flex justify-start">
-             <div className="flex items-start max-w-xl">
-                <SparklesIcon className="w-8 h-8 p-1.5 rounded-full bg-gray-600 text-sky-300 mr-2 flex-shrink-0" aria-hidden="true" />
-                <div className="px-4 py-2.5 rounded-xl shadow bg-gray-700 text-gray-200 rounded-bl-none">
-                    <LoadingSpinner size="sm" />
-                </div>
-            </div>
-          </div>
-        )}
-         {isLoading && messages.length === 0 && ( 
-          <div className="flex justify-start">
-             <div className="flex items-start max-w-xl">
-                <SparklesIcon className="w-8 h-8 p-1.5 rounded-full bg-gray-600 text-sky-300 mr-2 flex-shrink-0" aria-hidden="true" />
-                <div className="px-4 py-2.5 rounded-xl shadow bg-gray-700 text-gray-200 rounded-bl-none flex items-center">
-                    <LoadingSpinner size="sm" />
-                    <p className="ml-2 text-sm text-gray-400">AIペルソナが議論を開始しています...</p>
-                </div>
-            </div>
-          </div>
-        )}
         <div ref={messagesEndRef} />
       </div>
-      <form onSubmit={handleSubmit} className="p-4 border-t border-gray-700">
-        <div className="flex items-center bg-gray-700 rounded-lg p-1 shadow">
-          <input
-            type="text"
-            value={inputText}
-            onChange={(e) => setInputText(e.target.value)}
-            placeholder="AIの議論に割り込むか、質問してください..."
-            className="flex-grow bg-transparent p-2.5 text-gray-100 placeholder-gray-400 focus:outline-none"
-            disabled={isLoading || isProcessingAudioAction || isExtractingTags}
-            aria-label="メッセージ入力欄"
-          />
-          <button
-            type="submit"
-            disabled={isLoading || isProcessingAudioAction || isExtractingTags || !inputText.trim()}
-            className="bg-sky-500 text-white p-2.5 rounded-md hover:bg-sky-600 disabled:bg-gray-600 disabled:cursor-not-allowed transition duration-150 ease-in-out"
-            aria-label="メッセージを送信"
-          >
-            {(isLoading || isExtractingTags || isProcessingAudioAction) ? <LoadingSpinner size="xs" /> : <PaperAirplaneIcon className="w-5 h-5" />}
-          </button>
-        </div>
+
+      {/* 音声プレーヤーを表示 */}
+      {children}
+
+      <form onSubmit={handleSubmit} className="flex gap-2">
+        <input
+          type="text"
+          value={inputText}
+          onChange={(e) => setInputText(e.target.value)}
+          placeholder="メッセージを入力..."
+          className="flex-1 bg-gray-700 text-white rounded-lg px-4 py-2 focus:outline-none focus:ring-2 focus:ring-sky-500"
+          disabled={isLoading}
+        />
+        <button
+          type="submit"
+          disabled={isLoading || !inputText.trim()}
+          className="bg-sky-600 text-white rounded-lg px-4 py-2 hover:bg-sky-700 disabled:opacity-50 disabled:cursor-not-allowed"
+        >
+          <PaperAirplaneIcon className="w-5 h-5" />
+        </button>
       </form>
     </div>
   );
