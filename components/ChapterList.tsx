@@ -1,4 +1,3 @@
-
 import React from 'react';
 import { Chapter } from '../types';
 import { BookOpenIcon, EyeIcon, EyeSlashIcon, TrashIcon } from './Icons'; // Import TrashIcon
@@ -24,7 +23,7 @@ const ChapterList: React.FC<ChapterListProps> = ({ chapters, activeChapterId, on
           <li key={chapter.id}>
             <div
               onClick={() => onSelectChapter(chapter.id)}
-              className={`flex items-center justify-between p-2 h-9 rounded-md transition-colors duration-150 ease-in-out cursor-pointer group
+              className={`flex items-center justify-between p-2 h-9 rounded-md transition-colors duration-150 ease-in-out cursor-pointer group relative
                 ${activeChapterId === chapter.id
                   ? 'bg-sky-500 text-white shadow-sm'
                   : 'text-gray-300 hover:bg-gray-700 hover:text-white'
@@ -32,13 +31,18 @@ const ChapterList: React.FC<ChapterListProps> = ({ chapters, activeChapterId, on
               title={chapter.title}
             >
               {/* Left part: Book Icon and Title */}
-              <div className="flex items-center truncate">
+              <div className="flex items-center truncate group">
                 <BookOpenIcon className={`w-5 h-5 mr-2 flex-shrink-0 ${activeChapterId === chapter.id ? 'text-white' : 'text-sky-400 group-hover:text-white'}`} />
                 <span
                   className="block truncate font-medium leading-5"
                 >
                   {chapter.title}
                 </span>
+                <div className="absolute inset-0 opacity-0 group-hover:opacity-100 transition-opacity duration-200">
+                  <div className="absolute left-0 top-full mt-1 px-2 py-1 bg-gray-900 text-white text-sm rounded shadow-lg whitespace-normal max-w-xs z-10">
+                    {chapter.title}
+                  </div>
+                </div>
               </div>
 
               {/* Right part: Action Buttons */}
